@@ -363,6 +363,31 @@ extern TBUserDefaults * gTbDefaults;
 
 }
 
++(void) showInformationalNotification: (NSDictionary *) dict {
+
+    // Invoked on the main thread by TBShowInformationalMessage() to show a notification without a sound
+
+    NSString * title = nilIfNSNull([dict objectForKey: @"title"]);
+    NSString * msg   = nilIfNSNull([dict objectForKey: @"msg"]);
+
+    // Messages written for alert windows often end with blank lines, which look odd in a notification
+    msg = [msg stringByTrimmingCharactersInSet: [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    NSUserNotification * notification = [[[NSUserNotification alloc] init] autorelease];
+    NSUserNotificationCenter * center = [NSUserNotificationCenter defaultUserNotificationCenter];
+    if (   ( ! notification )
+        || ( ! center )  ) {
+        NSLog(@"Cannot create NSUserNotification or NSUserNotificationCenter");
+        TBShowAlertWindow(title, msg);
+        return;
+    }
+
+    [notification setTitle:           title];
+    [notification setInformativeText: msg];
+
+    [center deliverNotification: notification];
+}
+
 // The following method is a modified version of the code at http://stackoverflow.com/questions/10517386/how-to-give-nswindow-a-shake-effect-as-saying-no-as-in-login-failure-window/23491643#23491643
 
 +(void)shakeWindow: (NSWindow *) w {

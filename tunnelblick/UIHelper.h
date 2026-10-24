@@ -63,6 +63,8 @@
 
 +(void)         showAlertWindow: (NSDictionary *) dict;
 
++(void)         showInformationalNotification: (NSDictionary *) dict;
+
 +(void)         showSuccessNotificationTitle: (NSString *) title
                                          msg: (NSString *) msg;
 

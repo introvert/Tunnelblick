@@ -26,6 +26,16 @@
 #define ALLOW_OPENVPNSTART_KILL    TRUE
 #define ALLOW_OPENVPNSTART_KILLALL TRUE
 
+// Tag for the "Recent" menu items that are placed below the list of configurations on the Tunnelblick menu
+#define RECENT_CONFIGURATIONS_MENU_ITEM_TAG 0x54425243
+
+// Default maximum number of configurations that are shown in the "Recent" section of the Tunnelblick menu
+#define DEFAULT_MAX_RECENT_CONFIGURATIONS_ON_MENU 3
+
+// The "Recent" section of the Tunnelblick menu is shown only if there are more than this many configurations on the menu
+// or if some configurations are in folders (submenus)
+#define MIN_CONFIGURATIONS_TO_SHOW_RECENT_ON_MENU 4
+
 // The maximum 'argc' for openvpnstart
 #define OPENVPNSTART_MAX_ARGC 12
 
@@ -1030,6 +1040,10 @@ name = newValue;                                    \
 @"doNotShowDisconnectedNotificationWindows",	\
 @"doNotShowConnectionSubmenus",	\
 @"doNotShowConnectAndDisconnectPrefixOnMenuItems",  \
+@"disconnectOthersWhenConnecting",	\
+@"maxRecentConfigurationsOnMenu",	\
+@"recentlyConnectedDisplayNames",	\
+@"useAlertWindowsForInformationalMessages",	\
 @"doNotShowVpnDetailsMenuItem",	\
 @"doNotShowSuggestionOrBugReportMenuItem",	\
 @"doNotShowAddConfigurationMenuItem",	\

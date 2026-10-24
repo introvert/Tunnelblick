@@ -98,6 +98,9 @@
 "Disconnect" = "Disconnect";
 
 /* Button */
+"Disconnect Others and Connect" = "Disconnect Others and Connect";
+
+/* Button */
 "Do Not Re-enable Network Access" = "Do Not Re-enable Network Access";
 
 /* Button */
@@ -395,6 +398,9 @@
 
 /* Menu item */
 "Quit Tunnelblick" = "Quit Tunnelblick";
+
+/* Menu item. Header for a list of recently-connected VPN configurations. 'Option' is the name of the key on the keyboard. */
+"Recent (Option-click to switch)" = "Recent (Option-click to switch)";
 
 /* Menu Item */
 "Rename Configuration" = "Rename Configuration";

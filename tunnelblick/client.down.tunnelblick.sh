@@ -228,6 +228,12 @@ EOF
 	readonly TAP_DEVICE_HAS_BEEN_SET_NONE="$( get_item "$saved_info" '^[[:space:]]*TapDeviceHasBeenSetNone :' )"
 	readonly ALSO_USING_SETUP_KEYS="$(        get_item "$saved_info" '^[[:space:]]*bAlsoUsingSetupKeys :'     )"
 	readonly TUNNEL_DEVICE="$(                get_item "$saved_info" '^[[:space:]]*TunnelDevice :'            )"
+	readonly EXPECTED_DNS_ADDRESSES="$(       get_item "$saved_info" '^[[:space:]]*ExpectedDnsAddresses :'    )"
+
+	# When OpenVPN crashes, Tunnelblick runs this script without the options that OpenVPN would have passed to it, so use
+	# the settings saved by the 'up' script as well. (Otherwise network monitoring would not be stopped after a crash.)
+	readonly SAVED_MONITOR_NETWORK="$(        get_item "$saved_info" '^[[:space:]]*MonitorNetwork :'          )"
+	readonly SAVED_FLUSH_DNS_CACHE="$(        get_item "$saved_info" '^[[:space:]]*FlushDNSCache :'           )"
 
 	# Note: '\n' was translated into '\t' by the 'up' script before storing 'RestoreIpv6Services' and 'RestoreSecondaryServices', so we translate it back
 	local tmp ; tmp="$(                       get_item "$saved_info" '^[[:space:]]*RestoreIpv6Services :'     )"
@@ -245,6 +251,9 @@ EOF
     message="${message}TAP_DEVICE_HAS_BEEN_SET_NONE  = '$TAP_DEVICE_HAS_BEEN_SET_NONE'$LF"
     message="${message}ALSO_USING_SETUP_KEYS         = '$ALSO_USING_SETUP_KEYS'$LF"
     message="${message}TUNNEL_DEVICE                 = '$TUNNEL_DEVICE'$LF"
+    message="${message}EXPECTED_DNS_ADDRESSES        = '$EXPECTED_DNS_ADDRESSES'$LF"
+    message="${message}SAVED_MONITOR_NETWORK         = '$SAVED_MONITOR_NETWORK'$LF"
+    message="${message}SAVED_FLUSH_DNS_CACHE         = '$SAVED_FLUSH_DNS_CACHE'$LF"
     message="${message}SECONDARY_SERVICES_TO_RESTORE = '$SECONDARY_SERVICES_TO_RESTORE'"
     message="${message}IPV6_SERVICES_TO_RESTORE      = '$IPV6_SERVICES_TO_RESTORE'$LF"
 
@@ -288,7 +297,7 @@ remove_leasewatcher() {
 
     log_debug_message "Removing network monitoring because INHIBIT_NETWORK_MONITORING = '$INHIBIT_NETWORK_MONITORING'"
 
-	if $ARG_MONITOR_NETWORK_CONFIGURATION ; then
+	if $ARG_MONITOR_NETWORK_CONFIGURATION || [ "$SAVED_MONITOR_NETWORK" = "true" ] ; then
 
 		execute_command "Cancelled monitoring system configuration changes"       \
 						"Error happened while trying to cancel monitoring system configuration changes" \
@@ -363,7 +372,26 @@ EOF
 	local status=$?
 	log_message_if_nonzero $status "ERROR: status = $status trying to read State:/Network/OpenVPN/OldSMB"
 
-	if [ "${dns_old}" = "${no_such_key}" ] ; then
+	# If the DNS servers are not the ones the 'up' script set, something else (usually macOS, after joining a different network
+	# or renewing a DHCP lease) has replaced them since the VPN connected. The saved "original" settings are then out of date,
+	# and restoring them would leave the computer using DNS servers from the previous network, which may not be reachable.
+	# So leave the current settings alone in that case.
+	local dns_current_sa ; dns_current_sa="$( scutil <<-EOF | sed -n -e '/ServerAddresses/,/}/p' | grep -E '^[[:space:]]*[0-9]+ :' | sed -e 's/^.* : //'
+		open
+		show State:/Network/Service/${PSID}/DNS
+		quit
+EOF
+	)"
+	# shellcheck disable=SC2086
+	dns_current_sa="$( echo ${dns_current_sa} )"              # Normalize whitespace so the comparison below works
+	# shellcheck disable=SC2086
+	local dns_expected_sa ; dns_expected_sa="$( echo ${EXPECTED_DNS_ADDRESSES} )"
+
+	if [ -n "${dns_current_sa}" ] \
+	&& [ -n "${dns_expected_sa}" ] \
+	&& [ "${dns_current_sa}" != "${dns_expected_sa}" ] ; then
+		log_message "WARNING: Not restoring State:DNS because its DNS servers ('${dns_current_sa}') have been changed by the system since the VPN set them ('${dns_expected_sa}'), so the saved settings are out of date"
+	elif [ "${dns_old}" = "${no_such_key}" ] ; then
 		execute_command "Removed State:DNS" \
 						"Error happened while trying to remove State:DNS" \
 						scutil <<-EOF
@@ -512,7 +540,7 @@ debug_log_current_network_settings() {
 ##########################################################################################
 flushDNSCache()
 {
-    if ${ARG_FLUSH_DNS_CACHE} ; then
+    if ${ARG_FLUSH_DNS_CACHE} || [ "$SAVED_FLUSH_DNS_CACHE" = "true" ] ; then
 		if [ -f /usr/bin/dscacheutil ] ; then
 			execute_command "Flushed the DNS cache with dscacheutil -flushcache" \
 							"Error happened while trying to flush the DNS cache" \
