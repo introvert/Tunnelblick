@@ -106,6 +106,13 @@ AlertWindowController * TBShowAlertWindowExtended(NSString * title,
 												  BOOL				   checkboxIsOn);
 
 void TBShowAlertWindowClearCache(void);
+
+AlertWindowController * TBExistingAlertWindowController(NSString * title, NSString * msg);
+
+BOOL TBUserIsInteractingWithTunnelblick(void);
+
+void TBShowInformationalMessage(NSString * title, NSString * msg);
+
 void TBShowAlertWindowRemoveFromCache(NSString * preferenceKey, NSString * msg);
 
 int            TBRunAlertPanel          (NSString * title,

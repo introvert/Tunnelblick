@@ -69,6 +69,8 @@ extern NSArray          * gTotalUnits;
 
 -(void)             afterFailureHandler:            (NSTimer *)     timer;
 
+-(void)             addToRecentlyConnectedConfigurations;
+
 -(NSArray *)        argumentsForOpenvpnstartForNow: (BOOL)          forNow
 										 userKnows: (BOOL)			userKnows;
 
@@ -1243,13 +1245,10 @@ TBPROPERTY(          NSMutableArray *,         messagesIfConnectionFails,       
                       NSLocalizedString(@"Tunnelblick could not fetch IP address information before the connection to %@ was made.\n\n", @"Window text"),
                       [self localizedName]];
 
-    TBRunAlertPanelExtended(NSLocalizedString(@"Warning", @"Window text"),
-                            msg,
-                            nil, nil, nil,
-                            @"skipWarningThatIPANotFetchedBeforeConnection",
-                            NSLocalizedString(@"Do not warn about this again", @"Checkbox name"),
-                            nil,
-                            NSAlertDefaultReturn);
+    // Informational only, so show a notification instead of a modal panel that blocks until it is dismissed
+    if (  ! [gTbDefaults boolForKey: @"skipWarningThatIPANotFetchedBeforeConnection"]  ) {
+        TBShowInformationalMessage(NSLocalizedString(@"Warning", @"Window text"), msg);
+    }
 }
 
 -(void) ipInfoTimeoutBeforeConnectingDialog: (NSTimeInterval) timeoutToUse {
@@ -1259,13 +1258,13 @@ TBPROPERTY(          NSMutableArray *,         messagesIfConnectionFails,       
                                         @"Tunnelblick will not check that this computer's apparent IP address changes when %@ is connected.\n\n",
                                         @"Window text"), (double) timeoutToUse, [self localizedName]];
 
-    TBShowAlertWindow(NSLocalizedString(@"Warning", @"Window text"), msg);
+    TBShowInformationalMessage(NSLocalizedString(@"Warning", @"Window text"), msg);
 }
 
 -(void) ipInfoErrorDialog {
 
-    TBShowAlertWindow(NSLocalizedString(@"Warning", @"Window text"),
-                      NSLocalizedString(@"A problem occurred while checking this computer's apparent public IP address.\n\nSee the Console log for details.\n\n", @"Window text"));
+    TBShowInformationalMessage(NSLocalizedString(@"Warning", @"Window text"),
+                               NSLocalizedString(@"A problem occurred while checking this computer's apparent public IP address.\n\nSee the Console log for details.\n\n", @"Window text"));
 }
 
 -(void) ipInfoInternetNotReachableDialog {
@@ -1994,7 +1993,7 @@ static pthread_mutex_t areConnectingMutex = PTHREAD_MUTEX_INITIALIZER;
                                                  [NSString stringWithFormat: @"%@%@", mainMessage, warningMessage],
                                                  NSLocalizedString(@"Connect", @"Button"),  // Default button
                                                  NSLocalizedString(@"Cancel", @"Button"),   // Alternate button
-                                                 nil,
+                                                 NSLocalizedString(@"Disconnect Others and Connect", @"Button"), // Other button
                                                  @"skipWarningAboutSimultaneousConnections",
                                                  NSLocalizedString(@"Do not warn about this again", @"Checkbox name"),
                                                  nil,
@@ -2005,6 +2004,10 @@ static pthread_mutex_t areConnectingMutex = PTHREAD_MUTEX_INITIALIZER;
                 }
                 areConnecting = FALSE;
                 completelyDisconnected = TRUE;
+                if (  button == NSAlertOtherReturn  ) {
+                    [self addToLog: @"Switching; user chose to disconnect other configurations first"];
+                    [self performSelectorOnMainThread: @selector(switchToThisConfiguration) withObject: nil waitUntilDone: NO];
+                }
                 return;
             }
         }
@@ -3159,10 +3162,124 @@ ifConnectionPreference: (NSString *)     keySuffix
 		if (  [oldRequestedState isEqualToString: @"EXITING"]  ) {
 			[self displaySlowDisconnectionDialogLater];
 		}
+	} else if (   ( ([[NSApp currentEvent] modifierFlags] & NSEventModifierFlagOption) != 0 )
+               || [gTbDefaults boolForKey: @"disconnectOthersWhenConnecting"]  ) {
+        [self addToLog: @"Switching; 'Connect' (toggle) menu command invoked with Option key or 'disconnectOthersWhenConnecting'"];
+        [self switchToThisConfiguration];
 	} else {
         [self addToLog: @"Connecting; 'Connect' (toggle) menu command invoked"];
 		[self connect: sender userKnows: YES];
 	}
+}
+
+-(NSArray *) otherConfigurationsNotDisconnected {
+
+    NSMutableArray * list = [NSMutableArray arrayWithCapacity: 4];
+    VPNConnection * connection;
+    NSEnumerator * e = [[gMC myVPNConnectionDictionary] objectEnumerator];
+    while (  (connection = [e nextObject])  ) {
+        if (   (connection != self)
+            && (   ( ! [connection isDisconnected] )
+                || ( ! [connection noOpenvpnProcess] ) )  ) {
+            [list addObject: connection];
+        }
+    }
+
+    return list;
+}
+
+-(void) switchToThisConfiguration {
+
+    // Disconnects all other configurations, waits until they have completely disconnected, then connects this configuration.
+    //
+    // We wait because connecting while another configuration's 'down' script is still restoring the network settings can make this
+    // configuration's 'up' script save the other VPN's DNS settings as the "original" settings. They would be "restored" when this
+    // configuration disconnects, leaving the computer with DNS servers that can't be reached.
+    //
+    // Invoke on the main thread only.
+
+    if (  ! [self isDisconnected]  ) {
+        NSLog(@"switchToThisConfiguration: but '%@' is not disconnected", [self displayName]);
+        return;
+    }
+
+    if (  switchingToThisConfiguration  ) {
+        [self addToLog: @"Already waiting for other configurations to disconnect before connecting"];
+        return;
+    }
+
+    NSArray * others = [self otherConfigurationsNotDisconnected];
+    if (  [others count] == 0  ) {
+        [self connect: self userKnows: YES];
+        return;
+    }
+
+    NSMutableArray * names = [NSMutableArray arrayWithCapacity: [others count]];
+    VPNConnection * connection;
+    NSEnumerator * e = [others objectEnumerator];
+    while (  (connection = [e nextObject])  ) {
+        [names addObject: [connection displayName]];
+        if (  ! [connection isDisconnected]  ) {
+            [connection addToLog: [NSString stringWithFormat: @"Disconnecting; switching to '%@'", [self displayName]]];
+            [connection startDisconnectingUserKnows: @YES];
+        }
+    }
+
+    [self addToLog: [NSString stringWithFormat: @"Will connect after disconnecting %@", [names componentsJoinedByString: @", "]]];
+
+    // Wait at least as long as waitUntilCompletelyDisconnected does, because an OpenVPN process that is reconnecting can take a while to exit
+    NSTimeInterval timeout = [gTbDefaults timeIntervalForKey: @"timeoutForDisconnectingConfigurations"
+                                                     default: 10.0
+                                                         min: 0.0
+                                                         max: 100.0];
+    switchingToThisConfiguration = TRUE;
+    switchDeadline = [NSDate timeIntervalSinceReferenceDate] + (  (timeout == 0.0)
+                                                                ? 100.0
+                                                                : MAX(timeout, 60.0));
+    [self performSelector: @selector(connectWhenOtherConfigurationsHaveDisconnected) withObject: nil afterDelay: 0.2];
+}
+
+-(void) connectWhenOtherConfigurationsHaveDisconnected {
+
+    if (  ! switchingToThisConfiguration  ) {
+        return;
+    }
+
+    if (   gShuttingDownTunnelblick
+        || ( ! [self isDisconnected] )  ) {
+        switchingToThisConfiguration = FALSE;
+        return;
+    }
+
+    NSArray * others = [self otherConfigurationsNotDisconnected];
+    if (  [others count] != 0  ) {
+        if (  [NSDate timeIntervalSinceReferenceDate] < switchDeadline  ) {
+            [self performSelector: @selector(connectWhenOtherConfigurationsHaveDisconnected) withObject: nil afterDelay: 0.2];
+            return;
+        }
+
+        // Don't connect: the other configurations' 'down' scripts may still be restoring the network settings, and connecting now could
+        // leave the computer with DNS servers that can't be reached after this configuration disconnects
+        switchingToThisConfiguration = FALSE;
+
+        NSMutableArray * names = [NSMutableArray arrayWithCapacity: [others count]];
+        VPNConnection * connection;
+        NSEnumerator * e = [others objectEnumerator];
+        while (  (connection = [e nextObject])  ) {
+            [names addObject: [connection localizedName]];
+        }
+        NSString * namesString = [names componentsJoinedByString: @", "];
+
+        [self addToLog: [NSString stringWithFormat: @"Not connecting because timed out waiting for other configuration(s) to disconnect: %@", namesString]];
+        TBShowAlertWindow(NSLocalizedString(@"Tunnelblick", @"Window title"),
+                          [NSString stringWithFormat: NSLocalizedString(@"Tunnelblick did not connect %@ because %@ did not finish disconnecting.\n\n"
+                                                                        @"Try again after it has disconnected.", @"Window text. The first '%@' is the name of a VPN configuration. The second '%@' is the name of one or more other VPN configurations, separated by commas."),
+                           [self localizedName], namesString]);
+        return;
+    }
+
+    switchingToThisConfiguration = FALSE;
+    [self connect: self userKnows: YES];
 }
 
 -(BOOL) openvpnAllowsDynamicChallengeRegardlessOfAuthRetrySetting {
@@ -3331,6 +3448,9 @@ static pthread_mutex_t areDisconnectingMutex = PTHREAD_MUTEX_INITIALIZER;
 		[self setRequestedState: @"EXITING"];
     }
 
+    // Get the state before changing it to DISCONNECTING so we can tell below if OpenVPN was reconnecting
+    BOOL wasReconnecting = [[self state] isEqualToString: @"RECONNECTING"];
+
 	[self setState: @"DISCONNECTING"];
 	[self setConnectedSinceDate: [NSDate date]];
 
@@ -3344,7 +3464,7 @@ static pthread_mutex_t areDisconnectingMutex = PTHREAD_MUTEX_INITIALIZER;
 		return YES;
 	}
 
-	if (  [[self state] isEqualToString: @"RECONNECTING"]  ) {
+	if (  wasReconnecting  ) {
 		if (  ! disconnectWhenStateChanges  ) {
 			disconnectWhenStateChanges = TRUE;
 			TBLog(@"DB-CD", "setting disconnectWhenStateChanges to TRUE for '%@' because state = RECONNECTING", [self displayName]);
@@ -3898,14 +4018,10 @@ static pthread_mutex_t lastStateMutex = PTHREAD_MUTEX_INITIALIZER;
 	NSArray * addresses = [self dnsServers];
 	if (  ! addresses  ) {
 		[self addToLog: @"Warning: An error occurred while trying to get a list of the DNS servers"];
-		TBShowAlertWindowExtended(NSLocalizedString(@"Tunnelblick", @"Window title"),
-								  NSLocalizedString(@"There was a problem getting the list of the DNS servers.", @"Window text"),
-								  @"skipWarningAboutErrorGettingDnsServers",
-								  nil,
-								  nil,
-								  NSLocalizedString(@"Do not warn about this again for any configuration", @"Checkbox name"),
-								  nil,
-								  NO);
+		if (  ! [gTbDefaults boolForKey: @"skipWarningAboutErrorGettingDnsServers"]  ) {
+			TBShowInformationalMessage(NSLocalizedString(@"Tunnelblick", @"Window title"),
+									   NSLocalizedString(@"There was a problem getting the list of the DNS servers.", @"Window text"));
+		}
 		[threadPool drain];
 		return;
 	}
@@ -3913,14 +4029,10 @@ static pthread_mutex_t lastStateMutex = PTHREAD_MUTEX_INITIALIZER;
 	NSArray * knownPublicDnsServers = [gMC knownPublicDnsServerAddresses];
 	if (  ! knownPublicDnsServers  ) {
 		[self addToLog: @"Warning: An error occurred while trying to get the list of known public DNS servers"];
-		TBShowAlertWindowExtended(NSLocalizedString(@"Tunnelblick", @"Window title"),
-								  NSLocalizedString(@"There was a problem getting the list of known public DNS servers.", @"Window text"),
-								  @"skipWarningAboutErrorGettingKnownPublicDnsServers",
-								  nil,
-								  nil,
-								  NSLocalizedString(@"Do not warn about this again for any configuration", @"Checkbox name"),
-								  nil,
-								  NO);
+		if (  ! [gTbDefaults boolForKey: @"skipWarningAboutErrorGettingKnownPublicDnsServers"]  ) {
+			TBShowInformationalMessage(NSLocalizedString(@"Tunnelblick", @"Window title"),
+									   NSLocalizedString(@"There was a problem getting the list of known public DNS servers.", @"Window text"));
+		}
 		[threadPool drain];
 		return;
 	}
@@ -4044,6 +4156,7 @@ static pthread_mutex_t lastStateMutex = PTHREAD_MUTEX_INITIALIZER;
 
         if (  disconnectWhenStateChanges  ) {
             TBLog(@"DB-CD", @"Requesting disconnect of '%@' because disconnectWhenStateChanges is TRUE", [self displayName]);
+            disconnectWhenStateChanges = FALSE; // Request it only once per state change
             [self startDisconnectingUserKnows: @YES];
         }
 
@@ -5578,6 +5691,7 @@ static pthread_mutex_t lastStateMutex = PTHREAD_MUTEX_INITIALIZER;
         // Run the connected script, if any
         [self runScriptNamed: @"connected" openvpnstartCommand: @"connected"];
         [gTbDefaults setObject: displayName forKey: @"lastConnectedDisplayName"];
+        [self addToRecentlyConnectedConfigurations];
     } else if (   [newState isEqualToString: @"RECONNECTING"]
 			   && [self haveConnectedSince]  ) {
         if (  speakWhenDisconnected  ) {
@@ -5616,6 +5730,30 @@ static pthread_mutex_t lastStateMutex = PTHREAD_MUTEX_INITIALIZER;
 
     [gMC performSelectorOnMainThread:@selector(setState:) withObject:newState waitUntilDone:NO];
     [gMC performSelector: @selector(connectionStateDidChange:) withObject: self];
+}
+
+-(void) addToRecentlyConnectedConfigurations {
+
+    // Keeps a short, most-recent-first list of configurations that have connected. It is used for the "Recent" section of the Tunnelblick menu.
+
+    NSArray * oldList = [gTbDefaults arrayForKey: @"recentlyConnectedDisplayNames"];
+
+    NSMutableArray * newList = [NSMutableArray arrayWithCapacity: 10];
+    [newList addObject: [self displayName]];
+
+    NSString * name;
+    NSEnumerator * e = [oldList objectEnumerator];
+    while (   (name = [e nextObject])
+           && ([newList count] < 10)  ) {
+        if (   [[name class] isSubclassOfClass: [NSString class]]
+            && ( ! [newList containsObject: name] )  ) {
+            [newList addObject: name];
+        }
+    }
+
+    if (  ! [newList isEqualToArray: oldList]  ) {
+        [gTbDefaults setObject: newList forKey: @"recentlyConnectedDisplayNames"];
+    }
 }
 
 -(void) speakActivity: (NSString *) activityName {
@@ -5757,10 +5895,11 @@ static pthread_mutex_t lastStateMutex = PTHREAD_MUTEX_INITIALIZER;
             }
         }
 
-        // Remove submenu prefix if using submenus
+        // Remove submenu prefix if using submenus (but not on the "Recent" items, which are not in submenus)
         NSString * itemName = [connection localizedName];
         NSRange lastSlashRange = [itemName rangeOfString: @"/" options: NSBackwardsSearch range: NSMakeRange(0, [itemName length] - 1)];
         if (   (lastSlashRange.length != 0)
+            && ( [anItem tag] != RECENT_CONFIGURATIONS_MENU_ITEM_TAG )
             && ( ! [gTbDefaults boolForKey: @"doNotShowConnectionSubmenus"])  ) {
             itemName = [itemName substringFromIndex: lastSlashRange.location + 1];
         }

@@ -60,6 +60,87 @@ run_prefix_or_suffix()
 }
 
 ##########################################################################################
+stop_pending_dhcp_dns_configuration() {
+
+	# The 'up' script configures DNS for a TAP device that uses DHCP in a background job, after it waits for the DHCP lease.
+	# If the VPN disconnects before that job finishes, stop it, so it doesn't set the VPN's DNS servers after the VPN has
+	# disconnected. (Nothing would undo that.)
+	#
+	# Each job is described by a file named for the job's tunnel device that contains the job's process ID and its OpenVPN's
+	# process ID. Stop the job for this script's tunnel device ($dev), and any job whose OpenVPN is no longer running (which
+	# covers the case where Tunnelblick runs this script to clean up after OpenVPN crashed, when $dev is not defined).
+	# Jobs for other connections that are still running are left alone.
+
+	local pid_file job_pid openvpn_pid file_dev i
+	for pid_file in "/Library/Application Support/Tunnelblick/dhcp-dns-pid-"*.txt ; do
+
+		if [ ! -f "$pid_file" ] ; then
+			continue
+		fi
+
+		file_dev="${pid_file##*/dhcp-dns-pid-}"
+		file_dev="${file_dev%.txt}"
+		read -r job_pid openvpn_pid < "$pid_file" 2>/dev/null || true
+
+		if [ -z "$job_pid" ] \
+		|| ! ps -p "$job_pid" -o command= 2>/dev/null | grep -q 'up\.tunnelblick\.sh' ; then
+			rm -f "$pid_file" 2>/dev/null || true      # The job has finished
+			continue
+		fi
+
+		if [ "$file_dev" != "${dev:-}" ] \
+		&& [ -n "$openvpn_pid" ] \
+		&& ps -p "$openvpn_pid" -o comm= 2>/dev/null | grep -q 'openvpn$' ; then
+			continue                                     # The job belongs to another connection that is still running
+		fi
+
+		pkill -P "$job_pid" 2>/dev/null || true
+		kill "$job_pid"     2>/dev/null || true
+
+		for (( i=0; i<20; i++ )) ; do
+			if ! ps -p "$job_pid" &>/dev/null ; then
+				break
+			fi
+			sleep 0.1
+		done
+
+		rm -f "$pid_file" 2>/dev/null || true
+
+		logMessage "Stopped the pending configuration of DNS via DHCP for $file_dev (process $job_pid) because the VPN is disconnecting"
+	done
+}
+
+##########################################################################################
+saved_state_belongs_to_another_running_openvpn() {
+
+	# @param String saved_pid - The OpenVPN process ID that the 'up' script saved in State:/Network/OpenVPN
+	#
+	# Returns 0 if State:/Network/OpenVPN was saved for a different OpenVPN process (another configuration) that is still running.
+	#
+	# State:/Network/OpenVPN holds the settings to restore for only one connection: the one that connected most recently.
+	# When several configurations are connected, a configuration that disconnects must not restore settings that belong
+	# to a configuration that is still connected. The configuration that owns them will restore them when it disconnects.
+	#
+	# When this script is run by OpenVPN, PPID is that OpenVPN process. When Tunnelblick runs it to clean up after OpenVPN
+	# crashed, the crashed process is not running any more, so its settings will be restored.
+
+	local saved_pid="$1"
+
+	if [ -z "$saved_pid" ] || [ "$saved_pid" = "$PPID" ] ; then
+		return 1
+	fi
+
+	# When OpenVPN uses the 'openvpn-down-root' plugin (for configurations with 'user' and/or 'group' options), the 'down'
+	# script is run by a process that the plugin forked from OpenVPN, so OpenVPN is the parent of PPID
+	local grandparent_pid ; grandparent_pid="$( ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ' || true )"
+	if [ "$saved_pid" = "$grandparent_pid" ] ; then
+		return 1
+	fi
+
+	ps -p "$saved_pid" -o comm= 2>/dev/null | grep -q 'openvpn$'
+}
+
+##########################################################################################
 # @param String "true" if should disable network access if disconnect was expected
 # @param String "true" if should disable network access if disconnect was not expected
 disableNetworkAccess()
@@ -168,6 +249,8 @@ readonly ARG_DISABLE_INTERNET_ACCESS_AFTER_DISCONNECTING ARG_DISABLE_INTERNET_AC
 
 run_prefix_or_suffix 'route-pre-down-prefix.sh'
 
+stop_pending_dhcp_dns_configuration
+
 # Quick check - is the configuration there?
 if ! scutil -w State:/Network/OpenVPN &>/dev/null -t 1 ; then
 
@@ -200,6 +283,20 @@ PSID="$(echo "${TUNNELBLICK_CONFIG}" | grep -i '^[[:space:]]*Service :' | sed -e
 # Don't need: PROCESS="$(echo "${TUNNELBLICK_CONFIG}" | grep -i '^[[:space:]]*PID :' | sed -e 's/^.*: //g')"
 # Don't need: ARG_IGNORE_OPTION_FLAGS="$(echo "${TUNNELBLICK_CONFIG}" | grep -i '^[[:space:]]*IgnoreOptionFlags :' | sed -e 's/^.*: //g')"
 ARG_TAP="$(echo "${TUNNELBLICK_CONFIG}" | grep -i '^[[:space:]]*IsTapInterface :' | sed -e 's/^.*: //g')"
+SAVED_OPENVPN_PID="$(echo "${TUNNELBLICK_CONFIG}" | grep -i '^[[:space:]]*PID :' | sed -e 's/^.*: //g')"
+
+if saved_state_belongs_to_another_running_openvpn "$SAVED_OPENVPN_PID" ; then
+
+	# Don't stop another connection's network monitoring or release another connection's DHCP lease
+	logMessage "WARNING: Not changing network monitoring or releasing a DHCP lease because the saved Tunnelblick information is for another VPN connection (OpenVPN process $SAVED_OPENVPN_PID) that is still connected."
+
+	disableNetworkAccess $ARG_DISABLE_INTERNET_ACCESS_AFTER_DISCONNECTING $ARG_DISABLE_INTERNET_ACCESS_AFTER_DISCONNECTING_UNEXPECTED
+
+	run_prefix_or_suffix 'route-pre-down-suffix.sh'
+	logMessage "End of output from ${OUR_NAME}"
+	logMessage "**********************************************"
+	exit 0
+fi
 
 bRouteGatewayIsDhcp="$(echo "${TUNNELBLICK_CONFIG}" | grep -i '^[[:space:]]*RouteGatewayIsDhcp :' | sed -e 's/^.*: //g')"
 sTunnelDevice="$(echo "${TUNNELBLICK_CONFIG}" | grep -i '^[[:space:]]*TunnelDevice :' | sed -e 's/^.*: //g')"
@@ -209,10 +306,10 @@ if ${ARG_TAP} ; then
         # Issue warning if the primary service ID has changed
         PSID_CURRENT="$( scutil <<-EOF |
             open
-            show State:/Network/OpenVPN
+            show State:/Network/Global/IPv4
             quit
 EOF
-grep Service | sed -e 's/.*Service : //'
+grep PrimaryService | sed -e 's/.*PrimaryService : //'
 )"
         if [ "${PSID}" != "${PSID_CURRENT}" ] ; then
             logMessage "WARNING: Ignoring change of Network Primary Service from ${PSID} to ${PSID_CURRENT}"

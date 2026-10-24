@@ -740,10 +740,58 @@ setupToMonitorNetworkConfiguration() {
         if [ "${LEASEWATCHER_TEMPLATE_PATH}" != "" ] ; then
             sed -e "s|/Applications/Tunnelblick\.app/Contents/Resources|${TB_RESOURCES_PATH}|g" "${LEASEWATCHER_TEMPLATE_PATH}" > "${LEASEWATCHER_PLIST_PATH}"
         fi
+        # Unload first in case a job left loaded by an earlier connection whose 'down' script did not run is still loaded
+        launchctl unload "${LEASEWATCHER_PLIST_PATH}" &> /dev/null || true
         launchctl load "${LEASEWATCHER_PLIST_PATH}"
     else
         willNotMonitorNetworkConfiguration
     fi
+}
+
+previous_vpn_dns_is_still_set() {
+
+	# @param String psid - ID of the primary network service
+	#
+	# Returns 0 if State:/Network/OpenVPN was left by an earlier VPN connection on the same network service AND that service's DNS
+	# servers are still the ones that the earlier connection set. That happens when the earlier connection's 'down' script did not
+	# run or did not finish (for example, because OpenVPN, Tunnelblick, or the computer crashed). Otherwise returns 1.
+	#
+	# It also happens when the earlier connection is still connected (several configurations connected at the same time). Keeping
+	# the settings from before ANY VPN connected is deliberate in that case, too, because then those are the settings in effect after
+	# all the connections have disconnected, in either order. (If the earlier connection disconnects first, its 'down' script does
+	# not restore anything because the saved settings belong to this connection. If this connection disconnects first, the earlier
+	# one is left without its DNS settings; Tunnelblick warns that 'Set nameserver' works for only one VPN at a time.) Saving the
+	# earlier VPN's settings instead would make the last disconnection "restore" DNS servers that are reachable only through that VPN.
+
+	local saved_state saved_service expected current
+
+	saved_state="$( scutil <<-EOF 2>/dev/null
+		open
+		show State:/Network/OpenVPN
+		quit
+EOF
+)"
+
+	saved_service="$( echo "${saved_state}" | grep -E '^[[:space:]]*Service :' | sed -e 's/^.*Service : //' )"
+	if [ -z "${saved_service}" ] || [ "${saved_service}" != "${1}" ] ; then
+		return 1
+	fi
+
+	# shellcheck disable=SC2046
+	expected="$( trim $( echo "${saved_state}" | grep -E '^[[:space:]]*ExpectedDnsAddresses :' | sed -e 's/^.*ExpectedDnsAddresses : //' ) )"
+	if [ -z "${expected}" ] ; then
+		return 1
+	fi
+
+	# shellcheck disable=SC2046
+	current="$( trim $( scutil <<-EOF 2>/dev/null | sed -n -e '/ServerAddresses/,/}/p' | grep -E '^[[:space:]]*[0-9]+ :' | sed -e 's/^.* : //'
+		open
+		show State:/Network/Service/${1}/DNS
+		quit
+EOF
+) )"
+
+	[ "${current}" = "${expected}" ]
 }
 
 setDnsServersAndDomainName() {
@@ -780,6 +828,16 @@ grep PrimaryService | sed -e 's/.*PrimaryService : //'
 )"
 
 	set -e # resume abort on error
+
+	# If an earlier connection's 'down' script did not run, the current DNS settings are that VPN's settings, and the settings from
+	# before that VPN connected are still saved in State:/Network/OpenVPN/OldDNS (etc.). Keep them instead of saving the earlier
+	# VPN's settings as the "original" ones; otherwise disconnecting would "restore" DNS servers that are only reachable through a VPN.
+	if previous_vpn_dns_is_still_set "${PSID}" ; then
+		logMessage "WARNING: DNS settings from an earlier VPN connection were never restored. Keeping the settings saved before that connection so they will be restored when this connection disconnects."
+		readonly SKP_SAVE_OLD="#"
+	else
+		readonly SKP_SAVE_OLD=""
+	fi
 
 	MAN_DNS_CONFIG="$( scutil <<-EOF |
 		open
@@ -1291,20 +1349,22 @@ sed -e 's/^[[:space:]]*[[:digit:]]* : //g' | tr '\n' ' '
 		# If there isn't a key, "TunnelblickNoSuchKey : true" won't be removed.
 		# If there is a key, "TunnelblickNoSuchKey : true" will be removed and the key's contents will be used
 
-		d.init
-		d.add TunnelblickNoSuchKey true
-		get State:/Network/Service/${PSID}/DNS
-		set State:/Network/OpenVPN/OldDNS
+		# (Unless they are left over from an earlier VPN connection whose 'down' script did not run; see SKP_SAVE_OLD)
 
-		d.init
-		d.add TunnelblickNoSuchKey true
-		get Setup:/Network/Service/${PSID}/DNS
-		set State:/Network/OpenVPN/OldDNSSetup
+		${SKP_SAVE_OLD}d.init
+		${SKP_SAVE_OLD}d.add TunnelblickNoSuchKey true
+		${SKP_SAVE_OLD}get State:/Network/Service/${PSID}/DNS
+		${SKP_SAVE_OLD}set State:/Network/OpenVPN/OldDNS
 
-		d.init
-		d.add TunnelblickNoSuchKey true
-		get State:/Network/Service/${PSID}/SMB
-		set State:/Network/OpenVPN/OldSMB
+		${SKP_SAVE_OLD}d.init
+		${SKP_SAVE_OLD}d.add TunnelblickNoSuchKey true
+		${SKP_SAVE_OLD}get Setup:/Network/Service/${PSID}/DNS
+		${SKP_SAVE_OLD}set State:/Network/OpenVPN/OldDNSSetup
+
+		${SKP_SAVE_OLD}d.init
+		${SKP_SAVE_OLD}d.add TunnelblickNoSuchKey true
+		${SKP_SAVE_OLD}get State:/Network/Service/${PSID}/SMB
+		${SKP_SAVE_OLD}set State:/Network/OpenVPN/OldSMB
 
 		# Initialize the new DNS map via State:
 		${SKP_DNS}d.init
@@ -2184,6 +2244,11 @@ sleep 2
 
 EXIT_CODE=0
 
+# Create the flag file before making any network changes, not just after making them. If this script fails part way through
+# (it runs with 'bash -e') and OpenVPN then exits without running the 'down' script, Tunnelblick sees the flag file and runs the
+# 'down' script itself to undo the changes that were made. (If no changes were made, the 'down' script finds nothing to restore.)
+touch "/Library/Application Support/Tunnelblick/downscript-needs-to-be-run.txt"
+
 if ${ARG_TAP} ; then
 
     # IPv6 should be re-enabled only for TUN, not TAP; the same for secondary network services
@@ -2221,7 +2286,8 @@ if ${ARG_TAP} ; then
 			logDebugMessage "ROUTE_GATEWAY_IS_DHCP is TRUE"
 			if [ -z "$dev" ]; then
 				logMessage "ERROR: Cannot configure TAP interface for DHCP without \$dev being defined. Exiting."
-				# We don't create the "/Library/Application Support/Tunnelblick/downscript-needs-to-be-run.txt" file, because the down script does NOT need to be run since we didn't do anything
+				# Remove the "/Library/Application Support/Tunnelblick/downscript-needs-to-be-run.txt" file, because the down script does NOT need to be run since we didn't do anything
+				rm -f "/Library/Application Support/Tunnelblick/downscript-needs-to-be-run.txt"
 				run_prefix_or_suffix 'up-suffix.sh'
 				logMessage "End of output from ${OUR_NAME}"
 				logMessage "**********************************************"
@@ -2246,7 +2312,12 @@ if ${ARG_TAP} ; then
 				configureDhcpDns
 			else
 				logMessage "Configuring tap DNS via DHCP asynchronously"
-				configureDhcpDns & # This must be run asynchronously; the DHCP lease will not complete until this script exits
+				# This must be run asynchronously; the DHCP lease will not complete until this script exits.
+				# Save the job's process ID so the 'route-pre-down' and 'down' scripts can stop it if the VPN disconnects before
+				# it finishes. Otherwise it could set the VPN's DNS servers after the VPN has disconnected, and nothing would undo that.
+				# The file is per tunnel device, and holds the job's process ID and OpenVPN's process ID. It is removed by those scripts.
+				configureDhcpDns &
+				echo "$! ${PPID}" > "/Library/Application Support/Tunnelblick/dhcp-dns-pid-${dev}.txt"
 				EXIT_CODE=0
 			fi
 		else

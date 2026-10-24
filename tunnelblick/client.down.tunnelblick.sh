@@ -182,6 +182,88 @@ run_prefix_or_suffix()
 	fi
 }
 
+
+##########################################################################################
+stop_pending_dhcp_dns_configuration() {
+
+	# The 'up' script configures DNS for a TAP device that uses DHCP in a background job, after it waits for the DHCP lease.
+	# If the VPN disconnects before that job finishes, stop it, so it doesn't set the VPN's DNS servers after the VPN has
+	# disconnected. (Nothing would undo that.)
+	#
+	# Each job is described by a file named for the job's tunnel device that contains the job's process ID and its OpenVPN's
+	# process ID. Stop the job for this script's tunnel device ($dev), and any job whose OpenVPN is no longer running (which
+	# covers the case where Tunnelblick runs this script to clean up after OpenVPN crashed, when $dev is not defined).
+	# Jobs for other connections that are still running are left alone.
+
+	local pid_file job_pid openvpn_pid file_dev i
+	for pid_file in "/Library/Application Support/Tunnelblick/dhcp-dns-pid-"*.txt ; do
+
+		if [ ! -f "$pid_file" ] ; then
+			continue
+		fi
+
+		file_dev="${pid_file##*/dhcp-dns-pid-}"
+		file_dev="${file_dev%.txt}"
+		read -r job_pid openvpn_pid < "$pid_file" 2>/dev/null || true
+
+		if [ -z "$job_pid" ] \
+		|| ! ps -p "$job_pid" -o command= 2>/dev/null | grep -q 'up\.tunnelblick\.sh' ; then
+			rm -f "$pid_file" 2>/dev/null || true      # The job has finished
+			continue
+		fi
+
+		if [ "$file_dev" != "${dev:-}" ] \
+		&& [ -n "$openvpn_pid" ] \
+		&& ps -p "$openvpn_pid" -o comm= 2>/dev/null | grep -q 'openvpn$' ; then
+			continue                                     # The job belongs to another connection that is still running
+		fi
+
+		pkill -P "$job_pid" 2>/dev/null || true
+		kill "$job_pid"     2>/dev/null || true
+
+		for (( i=0; i<20; i++ )) ; do
+			if ! ps -p "$job_pid" &>/dev/null ; then
+				break
+			fi
+			sleep 0.1
+		done
+
+		rm -f "$pid_file" 2>/dev/null || true
+
+		log_message "Stopped the pending configuration of DNS via DHCP for $file_dev (process $job_pid) because the VPN is disconnecting"
+	done
+}
+
+##########################################################################################
+saved_state_belongs_to_another_running_openvpn() {
+
+	# @param String saved_pid - The OpenVPN process ID that the 'up' script saved in State:/Network/OpenVPN
+	#
+	# Returns 0 if State:/Network/OpenVPN was saved for a different OpenVPN process (another configuration) that is still running.
+	#
+	# State:/Network/OpenVPN holds the settings to restore for only one connection: the one that connected most recently.
+	# When several configurations are connected, a configuration that disconnects must not restore settings that belong
+	# to a configuration that is still connected. The configuration that owns them will restore them when it disconnects.
+	#
+	# When this script is run by OpenVPN, PPID is that OpenVPN process. When Tunnelblick runs it to clean up after OpenVPN
+	# crashed, the crashed process is not running any more, so its settings will be restored.
+
+	local saved_pid="$1"
+
+	if [ -z "$saved_pid" ] || [ "$saved_pid" = "$PPID" ] ; then
+		return 1
+	fi
+
+	# When OpenVPN uses the 'openvpn-down-root' plugin (for configurations with 'user' and/or 'group' options), the 'down'
+	# script is run by a process that the plugin forked from OpenVPN, so OpenVPN is the parent of PPID
+	local grandparent_pid ; grandparent_pid="$( ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ' || true )"
+	if [ "$saved_pid" = "$grandparent_pid" ] ; then
+		return 1
+	fi
+
+	ps -p "$saved_pid" -o comm= 2>/dev/null | grep -q 'openvpn$'
+}
+
 ##########################################################################################
 get_info_saved_by_up_script() {
 
@@ -228,6 +310,24 @@ EOF
 	readonly TAP_DEVICE_HAS_BEEN_SET_NONE="$( get_item "$saved_info" '^[[:space:]]*TapDeviceHasBeenSetNone :' )"
 	readonly ALSO_USING_SETUP_KEYS="$(        get_item "$saved_info" '^[[:space:]]*bAlsoUsingSetupKeys :'     )"
 	readonly TUNNEL_DEVICE="$(                get_item "$saved_info" '^[[:space:]]*TunnelDevice :'            )"
+	readonly EXPECTED_DNS_ADDRESSES="$(       get_item "$saved_info" '^[[:space:]]*ExpectedDnsAddresses :'    )"
+	readonly SAVED_OPENVPN_PID="$(            get_item "$saved_info" '^[[:space:]]*PID :'                     )"
+
+	if saved_state_belongs_to_another_running_openvpn "$SAVED_OPENVPN_PID" ; then
+		log_message "WARNING: Not restoring network settings because they were saved for another VPN connection (OpenVPN process $SAVED_OPENVPN_PID) that is still connected. They will be restored when it disconnects."
+
+		log_message "End of output from ${OUR_NAME}"
+		log_message "**********************************************"
+
+		run_prefix_or_suffix 'down-suffix.sh'
+
+		exit 0
+	fi
+
+	# When OpenVPN crashes, Tunnelblick runs this script without the options that OpenVPN would have passed to it, so use
+	# the settings saved by the 'up' script as well. (Otherwise network monitoring would not be stopped after a crash.)
+	readonly SAVED_MONITOR_NETWORK="$(        get_item "$saved_info" '^[[:space:]]*MonitorNetwork :'          )"
+	readonly SAVED_FLUSH_DNS_CACHE="$(        get_item "$saved_info" '^[[:space:]]*FlushDNSCache :'           )"
 
 	# Note: '\n' was translated into '\t' by the 'up' script before storing 'RestoreIpv6Services' and 'RestoreSecondaryServices', so we translate it back
 	local tmp ; tmp="$(                       get_item "$saved_info" '^[[:space:]]*RestoreIpv6Services :'     )"
@@ -245,6 +345,9 @@ EOF
     message="${message}TAP_DEVICE_HAS_BEEN_SET_NONE  = '$TAP_DEVICE_HAS_BEEN_SET_NONE'$LF"
     message="${message}ALSO_USING_SETUP_KEYS         = '$ALSO_USING_SETUP_KEYS'$LF"
     message="${message}TUNNEL_DEVICE                 = '$TUNNEL_DEVICE'$LF"
+    message="${message}EXPECTED_DNS_ADDRESSES        = '$EXPECTED_DNS_ADDRESSES'$LF"
+    message="${message}SAVED_MONITOR_NETWORK         = '$SAVED_MONITOR_NETWORK'$LF"
+    message="${message}SAVED_FLUSH_DNS_CACHE         = '$SAVED_FLUSH_DNS_CACHE'$LF"
     message="${message}SECONDARY_SERVICES_TO_RESTORE = '$SECONDARY_SERVICES_TO_RESTORE'"
     message="${message}IPV6_SERVICES_TO_RESTORE      = '$IPV6_SERVICES_TO_RESTORE'$LF"
 
@@ -288,7 +391,7 @@ remove_leasewatcher() {
 
     log_debug_message "Removing network monitoring because INHIBIT_NETWORK_MONITORING = '$INHIBIT_NETWORK_MONITORING'"
 
-	if $ARG_MONITOR_NETWORK_CONFIGURATION ; then
+	if $ARG_MONITOR_NETWORK_CONFIGURATION || [ "$SAVED_MONITOR_NETWORK" = "true" ] ; then
 
 		execute_command "Cancelled monitoring system configuration changes"       \
 						"Error happened while trying to cancel monitoring system configuration changes" \
@@ -363,7 +466,26 @@ EOF
 	local status=$?
 	log_message_if_nonzero $status "ERROR: status = $status trying to read State:/Network/OpenVPN/OldSMB"
 
-	if [ "${dns_old}" = "${no_such_key}" ] ; then
+	# If the DNS servers are not the ones the 'up' script set, something else (usually macOS, after joining a different network
+	# or renewing a DHCP lease) has replaced them since the VPN connected. The saved "original" settings are then out of date,
+	# and restoring them would leave the computer using DNS servers from the previous network, which may not be reachable.
+	# So leave the current settings alone in that case.
+	local dns_current_sa ; dns_current_sa="$( scutil <<-EOF | sed -n -e '/ServerAddresses/,/}/p' | grep -E '^[[:space:]]*[0-9]+ :' | sed -e 's/^.* : //'
+		open
+		show State:/Network/Service/${PSID}/DNS
+		quit
+EOF
+	)"
+	# shellcheck disable=SC2086
+	dns_current_sa="$( echo ${dns_current_sa} )"              # Normalize whitespace so the comparison below works
+	# shellcheck disable=SC2086
+	local dns_expected_sa ; dns_expected_sa="$( echo ${EXPECTED_DNS_ADDRESSES} )"
+
+	if [ -n "${dns_current_sa}" ] \
+	&& [ -n "${dns_expected_sa}" ] \
+	&& [ "${dns_current_sa}" != "${dns_expected_sa}" ] ; then
+		log_message "WARNING: Not restoring State:DNS because its DNS servers ('${dns_current_sa}') have been changed by the system since the VPN set them ('${dns_expected_sa}'), so the saved settings are out of date"
+	elif [ "${dns_old}" = "${no_such_key}" ] ; then
 		execute_command "Removed State:DNS" \
 						"Error happened while trying to remove State:DNS" \
 						scutil <<-EOF
@@ -512,7 +634,7 @@ debug_log_current_network_settings() {
 ##########################################################################################
 flushDNSCache()
 {
-    if ${ARG_FLUSH_DNS_CACHE} ; then
+    if ${ARG_FLUSH_DNS_CACHE} || [ "$SAVED_FLUSH_DNS_CACHE" = "true" ] ; then
 		if [ -f /usr/bin/dscacheutil ] ; then
 			execute_command "Flushed the DNS cache with dscacheutil -flushcache" \
 							"Error happened while trying to flush the DNS cache" \
@@ -761,6 +883,8 @@ if [ -e "/Library/Application Support/Tunnelblick/shutting-down-computer.txt" ] 
 else
 
 	profile_or_execute run_prefix_or_suffix 'down-prefix.sh'
+
+	profile_or_execute stop_pending_dhcp_dns_configuration
 
 	# Note: The following command will exit this script if the info cannot be accessed
 	profile_or_execute get_info_saved_by_up_script

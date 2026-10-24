@@ -151,6 +151,8 @@ BOOL needToRepairPackages(void);
                                            fromMenu:        (NSMenu *)          theMenu
                                         workingName:        (NSString *)        workingName;
 -(void)             runCustomMenuItem:                      (NSMenuItem *)      item;
+-(void)             removeRecentConfigurationsMenuItems;
+-(void)             updateRecentConfigurationsMenuItems;
 -(BOOL)             setupHookupWatchdogTimer;
 -(void)             setupHotKeyWithCode:                    (UInt32)            keyCode
                         andModifierKeys:                    (UInt32)            modifierKeys;
@@ -1537,6 +1539,7 @@ TBSYNTHESIZE_OBJECT(retain, NSDate       *, lastCheckNow,              setLastCh
 
 -(void) menuWillOpen: (NSMenu *) menu {
     if (  menu == myVPNMenu  ) {
+        [self updateRecentConfigurationsMenuItems];
         menuIsOpen = TRUE;
         [self updateIconImage];    // Display the new images
     }
@@ -1882,18 +1885,146 @@ TBSYNTHESIZE_OBJECT(retain, NSDate       *, lastCheckNow,              setLastCh
 -(int) indexOfWhereFirstConnectionItemShouldGoInTunnelblickMenu {
 
     // Calculate the index of where the first connection item should go.
-    // FRAGILE, and has broken before!
+    //
+    // createMenu adds: status, ["Re-enable Network Access"], separator, update available, configuration update available, warnings, separator,
+    //                  ["VPN Details...", separator], then the configurations.
+    //
+    // Find the warnings item and work from it, so that adding items above it doesn't break this. (A hard-coded count has broken before.)
 
-    BOOL showEnableNetworkServices = [gFileMgr fileExistsAtPath: L_AS_T_DISABLED_NETWORK_SERVICES_PATH];
     BOOL showVpnDetailsAtTop = (   ( ! [gTbDefaults boolForKey:@"doNotShowVpnDetailsMenuItem"] )
                                 && ( ! [gTbDefaults boolForKey:@"putVpnDetailsAtBottom"] ) );
-    return (4 // status, separator, warnings, separator
+
+    NSInteger warningsIx = (  warningsItem
+                            ? [myVPNMenu indexOfItem: warningsItem]
+                            : -1);
+    if (  warningsIx != -1  ) {
+        return (int)(  warningsIx
+                     + 2    // warnings, separator
+                     + (showVpnDetailsAtTop ? 2 : 0 ));
+    }
+
+    BOOL showEnableNetworkServices = [gFileMgr fileExistsAtPath: L_AS_T_DISABLED_NETWORK_SERVICES_PATH];
+    return (6 // status, separator, update available, configuration update available, warnings, separator
             + (showVpnDetailsAtTop ? 2 : 0 )
             + (showEnableNetworkServices ? 1 : 0));
 }
 
 // Lock this to change myVPNMenu
 static pthread_mutex_t myVPNMenuMutex = PTHREAD_MUTEX_INITIALIZER;
+
+-(BOOL) shouldShowRecentConfigurationsOnMenu {
+
+    // The "Recent" section is useful only if the list of configurations is long or uses folders (submenus)
+
+    NSUInteger nShown = 0;
+    BOOL usesSubmenus = FALSE;
+    BOOL submenusAllowed = ! [gTbDefaults boolForKey: @"doNotShowConnectionSubmenus"];
+    NSString * dispNm;
+    NSEnumerator * e = [[self myConfigDictionary] keyEnumerator];
+    while (  (dispNm = [e nextObject])  ) {
+        if (  ! [gTbDefaults boolForKey: [dispNm stringByAppendingString: @"-doNotShowOnTunnelblickMenu"]]  ) {
+            nShown++;
+            if (   submenusAllowed
+                && ( [dispNm rangeOfString: @"/"].length != 0 )  ) {
+                usesSubmenus = TRUE;
+            }
+        }
+    }
+
+    return (   usesSubmenus
+            || (nShown > MIN_CONFIGURATIONS_TO_SHOW_RECENT_ON_MENU)  );
+}
+
+-(void) removeRecentConfigurationsMenuItems {
+
+    // Removes the "Recent" section from the Tunnelblick menu. LOCK myVPNMenuMutex BEFORE INVOKING THIS METHOD.
+    //
+    // This must be done before a configuration's VPNConnection is released, because a menu item does not retain its target.
+
+    NSInteger ix;
+    while (  (ix = [myVPNMenu indexOfItemWithTag: RECENT_CONFIGURATIONS_MENU_ITEM_TAG]) != -1  ) {
+        [myVPNMenu removeItemAtIndex: ix];
+    }
+}
+
+-(void) updateRecentConfigurationsMenuItems {
+
+    // Puts the most recently connected configurations in a "Recent" section below the list of all configurations,
+    // so it is quick to connect, disconnect, or switch (Option-click) between them without opening folders or scrolling.
+    //
+    // The items are tagged so they can be removed and recreated each time the menu opens.
+    // Invoked on the main thread by menuWillOpen:
+
+    if (  pthread_mutex_trylock( &myVPNMenuMutex ) != 0  ) {
+        return; // The menu is being changed. (Anything that releases a VPNConnection removes the "Recent" items first.)
+    }
+
+    NSMenu * menu = myVPNMenu;
+
+    [self removeRecentConfigurationsMenuItems];
+
+    unsigned maxRecent = [gTbDefaults unsignedIntForKey: @"maxRecentConfigurationsOnMenu"
+                                                default: DEFAULT_MAX_RECENT_CONFIGURATIONS_ON_MENU
+                                                    min: 0
+                                                    max: 10];
+
+    NSMutableArray * connections = [NSMutableArray arrayWithCapacity: maxRecent];
+    if (   (maxRecent != 0)
+        && [self shouldShowRecentConfigurationsOnMenu]  ) {
+        NSString * dispNm;
+        NSEnumerator * e = [[gTbDefaults arrayForKey: @"recentlyConnectedDisplayNames"] objectEnumerator];
+        while (   (dispNm = [e nextObject])
+               && ([connections count] < maxRecent)  ) {
+            if (  ! [[dispNm class] isSubclassOfClass: [NSString class]]  ) {
+                continue;
+            }
+            VPNConnection * connection = [[self myVPNConnectionDictionary] objectForKey: dispNm];
+            if (   connection
+                && ( ! [gTbDefaults boolForKey: [dispNm stringByAppendingString: @"-doNotShowOnTunnelblickMenu"]] )  ) {
+                [connections addObject: connection];
+            }
+        }
+    }
+
+    if (  [connections count] != 0  ) {
+
+        // Insert after the separator that ends the list of configurations
+        NSInteger insertIx = -1;
+        NSInteger ix;
+        for (  ix = [self indexOfWhereFirstConnectionItemShouldGoInTunnelblickMenu]; ix < [menu numberOfItems]; ix++  ) {
+            if (  [[menu itemAtIndex: ix] isSeparatorItem]  ) {
+                insertIx = ix + 1;
+                break;
+            }
+        }
+
+        if (  insertIx != -1  ) {
+            NSMenuItem * header = [[[NSMenuItem alloc] init] autorelease];
+            [header setTitle: NSLocalizedString(@"Recent (Option-click to switch)", @"Menu item. Header for a list of recently-connected VPN configurations. 'Option' is the name of the key on the keyboard.")];
+            [header setEnabled: NO];
+            [header setTag: RECENT_CONFIGURATIONS_MENU_ITEM_TAG];
+            [menu insertItem: header atIndex: insertIx++];
+
+            VPNConnection * connection;
+            NSEnumerator * e = [connections objectEnumerator];
+            while (  (connection = [e nextObject])  ) {
+                // Note: The menu item's title and state will be set in VPNConnection's validateMenuItem
+                NSMenuItem * item = [[[NSMenuItem alloc] init] autorelease];
+                [item setTitle: [connection localizedName]];
+                [item setTarget: connection];
+                [item setAction: @selector(toggle:)];
+                [item setTag: RECENT_CONFIGURATIONS_MENU_ITEM_TAG];
+                [menu insertItem: item atIndex: insertIx++];
+            }
+
+            NSMenuItem * separator = [NSMenuItem separatorItem];
+            [separator setTag: RECENT_CONFIGURATIONS_MENU_ITEM_TAG];
+            [menu insertItem: separator atIndex: insertIx];
+        }
+    }
+
+    pthread_mutex_unlock( &myVPNMenuMutex );
+}
 
 -(void) createMenu
 {
@@ -2005,7 +2136,7 @@ static pthread_mutex_t myVPNMenuMutex = PTHREAD_MUTEX_INITIALIZER;
     [statusMenuItem setAction: @selector(disconnectAllMenuItemWasClicked:)];
 
     NSMenu * newMenu = [[NSMenu alloc] init];
-    [myVPNMenu setDelegate:self];
+    [newMenu setDelegate:self]; // (Must be set on the new menu, which replaces myVPNMenu below, or menuWillOpen: etc. will not be invoked)
 
     [newMenu addItem:statusMenuItem];
 
@@ -2718,8 +2849,8 @@ static pthread_mutex_t configModifyMutex = PTHREAD_MUTEX_INITIALIZER;
 
         if (  gone  ) {
             NSString * localName = [myConnection localizedName];
-            TBShowAlertWindow([NSString stringWithFormat: NSLocalizedString(@"'%@' has been disconnected", @"Window title"), localName],
-                              [NSString stringWithFormat: NSLocalizedString(@"Tunnelblick has disconnected '%@' because its configuration file has been removed.", @"Window text"), localName]);
+            TBShowInformationalMessage([NSString stringWithFormat: NSLocalizedString(@"'%@' has been disconnected", @"Window title"), localName],
+                                       [NSString stringWithFormat: NSLocalizedString(@"Tunnelblick has disconnected '%@' because its configuration file has been removed.", @"Window text"), localName]);
         }
     }
 
@@ -2738,6 +2869,10 @@ static pthread_mutex_t configModifyMutex = PTHREAD_MUTEX_INITIALIZER;
         }
         return;
     }
+
+    // Remove the "Recent" menu items (they will be recreated when the menu is next opened) because one of them may target this
+    // configuration's VPNConnection, which will be released when it is removed from myVPNConnectionDictionary
+    [self removeRecentConfigurationsMenuItems];
 
     // Remove connection from myVPNConnectionDictionary
     NSMutableDictionary * tempVPNConnectionDictionary = [myVPNConnectionDictionary mutableCopy];

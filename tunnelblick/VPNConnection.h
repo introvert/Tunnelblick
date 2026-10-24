@@ -162,6 +162,9 @@ struct Statistics {
 	BOOL volatile	connectAfterDisconnectUserKnows; // Argument for the reconnect
     BOOL volatile   completelyDisconnected; // True only after GUI has caught up to disconnect request
 
+    BOOL            switchingToThisConfiguration; // True while waiting for other configurations to disconnect before connecting this one
+    NSTimeInterval  switchDeadline;               // When to stop waiting for the other configurations to disconnect (since reference date)
+
 	BOOL volatile   skipConfigurationUpdateCheckOnce; // True only after have skipped a configuration update, so the next
 													  // connection attempt will not try to check for the update
 }
@@ -293,6 +296,8 @@ struct Statistics {
 -(void)             storeMipIfItDoesNotExistUsingSystemAuth: (SystemAuth *) systemAuth;
 
 -(IBAction)         toggle:                     (id)            sender;
+
+-(void)             switchToThisConfiguration;
 
 -(void)             tryToHookup:                (NSDictionary *) dict;
 

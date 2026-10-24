@@ -899,7 +899,7 @@ AlertWindowController * TBShowAlertWindowExtended(NSString * title,
 								NSNullIfNil(msg),                 @"msg",
 								NSNullIfNil(preferenceToSetTrue), @"preferenceToSetTrue",
 								NSNullIfNil(preferenceName),	  @"preferenceName",
-								NSNullIfNil(preferenceValue),	  @"preferenceName",
+								NSNullIfNil(preferenceValue),	  @"preferenceValue",
 								NSNullIfNil(checkboxTitle),       @"checkboxTitle",
 								NSNullIfNil(checkboxInfoTitle),   @"checkboxInfoTitle",
 								[NSNumber numberWithBool: checkboxIsOn], @"checkboxIsOn",
@@ -927,18 +927,6 @@ AlertWindowController * TBShowAlertWindowExtended(NSString * title,
         [showAlertWindowAlreadyShownWindowPreferencesCache addObject: preferenceToSetTrue];
 	}
 
-	AlertWindowController * awc = [[[AlertWindowController alloc] init] autorelease];
-
-	[awc setHeadline:			 title];
-	[awc setPreferenceToSetTrue: (  [preferenceToSetTrue hasSuffix: @"-NotAnActualPreference"]
-                                  ? nil
-                                  : preferenceToSetTrue)];
-	[awc setPreferenceName:      preferenceName];
-	[awc setPreferenceValue:     preferenceValue];
-	[awc setCheckboxTitle:       checkboxTitle];
-	[awc setCheckboxInfoTitle:   checkboxInfoTitle];
-	[awc setCheckboxIsChecked:   checkboxIsOn];
-
     NSAttributedString * displayMessage = nil;
 
     if (  [[msg class] isSubclassOfClass: [NSAttributedString class]]  ) {
@@ -962,14 +950,126 @@ AlertWindowController * TBShowAlertWindowExtended(NSString * title,
         displayMessage = [[[NSAttributedString alloc] initWithString: NSLocalizedString(@"Program error, please see the Console log.", @"Window text")] autorelease];
     }
 
+    // If an identical alert is already being displayed, bring it to the front instead of stacking another copy on top of it.
+    // (For example, when a connection fails repeatedly while reconnecting.)
+    AlertWindowController * existing = TBExistingAlertWindowController(title, [displayMessage string]);
+    if (  existing  ) {
+        TBLog(@"DB-SD", @"Not displaying a duplicate alert window '%@'", title);
+        [[existing window] orderFrontRegardless];
+        return existing;
+    }
+
+	AlertWindowController * awc = [[[AlertWindowController alloc] init] autorelease];
+
+	[awc setHeadline:			 title];
+	[awc setPreferenceToSetTrue: (  [preferenceToSetTrue hasSuffix: @"-NotAnActualPreference"]
+                                  ? nil
+                                  : preferenceToSetTrue)];
+	[awc setPreferenceName:      preferenceName];
+	[awc setPreferenceValue:     preferenceValue];
+	[awc setCheckboxTitle:       checkboxTitle];
+	[awc setCheckboxInfoTitle:   checkboxInfoTitle];
+	[awc setCheckboxIsChecked:   checkboxIsOn];
+
     [awc setMessageAS: displayMessage];
 
 	NSWindow * win = [awc window];
     [win center];
 	[awc showWindow:  nil];
-	[win makeKeyAndOrderFront: nil];
-    [gMC activateIgnoringOtherApps];
+
+    if (  TBUserIsInteractingWithTunnelblick()  ) {
+        [win makeKeyAndOrderFront: nil];
+        [gMC activateIgnoringOtherApps];
+    } else {
+        // Show the alert without taking keyboard focus away from whatever the user is doing in another app
+        [win orderFrontRegardless];
+    }
+
 	return awc;
+}
+
+void TBShowInformationalMessage(NSString * title, NSString * msg) {
+
+    // Shows a message that is informational only -- the user doesn't need to do anything about it -- as a macOS notification
+    // instead of as an alert window that must be dismissed. The message is also logged so it is available later.
+    //
+    // The "useAlertWindowsForInformationalMessages" preference shows them in alert windows instead.
+    //
+    // May be invoked on any thread.
+
+    NSLog(@"%@: %@", title, msg);
+
+    if (  [gTbDefaults boolForKey: @"useAlertWindowsForInformationalMessages"]  ) {
+        TBShowAlertWindow(title, msg);
+        return;
+    }
+
+    NSDictionary * dict = [NSDictionary dictionaryWithObjectsAndKeys:
+                           NSNullIfNil(title), @"title",
+                           NSNullIfNil(msg),   @"msg",
+                           nil];
+    [UIHelper performSelectorOnMainThread: @selector(showInformationalNotification:) withObject: dict waitUntilDone: NO];
+}
+
+AlertWindowController * TBExistingAlertWindowController(NSString * title, NSString * msg) {
+
+    // Returns the controller of a visible alert window with the same headline and message, or nil if there is none
+
+    NSWindow * win;
+    NSEnumerator * e = [[NSApp windows] objectEnumerator];
+    while (  (win = [e nextObject])  ) {
+        id controller = [win windowController];
+        if (   [win isVisible]
+            && [controller isKindOfClass: [AlertWindowController class]]  ) {
+            AlertWindowController * awc = (AlertWindowController *)controller;
+            NSString * existingTitle = [awc headline];
+            NSString * existingMsg   = [[awc messageAS] string];
+            if (   (   (existingTitle == title)
+                    || [existingTitle isEqualToString: title] )
+                && (   (existingMsg == msg)
+                    || [existingMsg isEqualToString: msg] )  ) {
+                return awc;
+            }
+        }
+    }
+
+    return nil;
+}
+
+BOOL TBUserIsInteractingWithTunnelblick(void) {
+
+    // Returns TRUE if Tunnelblick is the active app, the Tunnelblick menu is open, or the user clicked or typed in Tunnelblick
+    // (including choosing a Tunnelblick menu command) within the last few seconds.
+    //
+    // Used to decide whether an alert window should take the keyboard focus. Alerts caused by background events (a network change,
+    // a reconnection, an IP address check) should not steal focus from the app the user is working in.
+
+    if (   [NSApp isActive]
+        || [gMC menuIsOpen]  ) {
+        return YES;
+    }
+
+    NSEvent * event = [NSApp currentEvent];
+    if (  ! event  ) {
+        return NO;
+    }
+
+    switch (  [event type]  ) {
+        case NSEventTypeLeftMouseDown:
+        case NSEventTypeLeftMouseUp:
+        case NSEventTypeRightMouseDown:
+        case NSEventTypeRightMouseUp:
+        case NSEventTypeKeyDown:
+        case NSEventTypeKeyUp:
+            break;
+        default:
+            return NO;
+    }
+
+    // [event timestamp] is the time since system startup
+    NSTimeInterval age = [[NSProcessInfo processInfo] systemUptime] - [event timestamp];
+    return (   (age >= 0.0)
+            && (age < 5.0)  );
 }
 
 void TBShowAlertWindowClearCache(void) {
