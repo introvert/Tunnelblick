@@ -182,6 +182,64 @@ run_prefix_or_suffix()
 	fi
 }
 
+
+##########################################################################################
+stop_pending_dhcp_dns_configuration() {
+
+	# The 'up' script configures DNS for a TAP device that uses DHCP in a background job, after it waits for the DHCP lease.
+	# If the VPN disconnects before that job finishes, stop it, so it doesn't set the VPN's DNS servers after the VPN has
+	# disconnected. (Nothing would undo that.)
+
+	local pid_file="/Library/Application Support/Tunnelblick/dhcp-dns-pid.txt"
+	if [ ! -f "$pid_file" ] ; then
+		return 0
+	fi
+
+	local job_pid ; job_pid="$( cat "$pid_file" 2>/dev/null || true )"
+	rm -f "$pid_file"
+
+	if [ -z "$job_pid" ] \
+	|| ! ps -p "$job_pid" -o command= 2>/dev/null | grep -q 'up\.tunnelblick\.sh' ; then
+		return 0
+	fi
+
+	pkill -P "$job_pid" 2>/dev/null || true
+	kill "$job_pid"     2>/dev/null || true
+
+	local i
+	for (( i=0; i<20; i++ )) ; do
+		if ! ps -p "$job_pid" &>/dev/null ; then
+			break
+		fi
+		sleep 0.1
+	done
+
+	log_message "Stopped the pending configuration of DNS via DHCP (process $job_pid) because the VPN is disconnecting"
+}
+
+##########################################################################################
+saved_state_belongs_to_another_running_openvpn() {
+
+	# @param String saved_pid - The OpenVPN process ID that the 'up' script saved in State:/Network/OpenVPN
+	#
+	# Returns 0 if State:/Network/OpenVPN was saved for a different OpenVPN process (another configuration) that is still running.
+	#
+	# State:/Network/OpenVPN holds the settings to restore for only one connection: the one that connected most recently.
+	# When several configurations are connected, a configuration that disconnects must not restore settings that belong
+	# to a configuration that is still connected. The configuration that owns them will restore them when it disconnects.
+	#
+	# When this script is run by OpenVPN, PPID is that OpenVPN process. When Tunnelblick runs it to clean up after OpenVPN
+	# crashed, the crashed process is not running any more, so its settings will be restored.
+
+	local saved_pid="$1"
+
+	if [ -z "$saved_pid" ] || [ "$saved_pid" = "$PPID" ] ; then
+		return 1
+	fi
+
+	ps -p "$saved_pid" -o comm= 2>/dev/null | grep -q 'openvpn$'
+}
+
 ##########################################################################################
 get_info_saved_by_up_script() {
 
@@ -229,6 +287,18 @@ EOF
 	readonly ALSO_USING_SETUP_KEYS="$(        get_item "$saved_info" '^[[:space:]]*bAlsoUsingSetupKeys :'     )"
 	readonly TUNNEL_DEVICE="$(                get_item "$saved_info" '^[[:space:]]*TunnelDevice :'            )"
 	readonly EXPECTED_DNS_ADDRESSES="$(       get_item "$saved_info" '^[[:space:]]*ExpectedDnsAddresses :'    )"
+	readonly SAVED_OPENVPN_PID="$(            get_item "$saved_info" '^[[:space:]]*PID :'                     )"
+
+	if saved_state_belongs_to_another_running_openvpn "$SAVED_OPENVPN_PID" ; then
+		log_message "WARNING: Not restoring network settings because they were saved for another VPN connection (OpenVPN process $SAVED_OPENVPN_PID) that is still connected. They will be restored when it disconnects."
+
+		log_message "End of output from ${OUR_NAME}"
+		log_message "**********************************************"
+
+		run_prefix_or_suffix 'down-suffix.sh'
+
+		exit 0
+	fi
 
 	# When OpenVPN crashes, Tunnelblick runs this script without the options that OpenVPN would have passed to it, so use
 	# the settings saved by the 'up' script as well. (Otherwise network monitoring would not be stopped after a crash.)
@@ -789,6 +859,8 @@ if [ -e "/Library/Application Support/Tunnelblick/shutting-down-computer.txt" ] 
 else
 
 	profile_or_execute run_prefix_or_suffix 'down-prefix.sh'
+
+	profile_or_execute stop_pending_dhcp_dns_configuration
 
 	# Note: The following command will exit this script if the info cannot be accessed
 	profile_or_execute get_info_saved_by_up_script

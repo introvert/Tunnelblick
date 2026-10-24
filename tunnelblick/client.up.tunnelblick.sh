@@ -2305,7 +2305,11 @@ if ${ARG_TAP} ; then
 				configureDhcpDns
 			else
 				logMessage "Configuring tap DNS via DHCP asynchronously"
-				configureDhcpDns & # This must be run asynchronously; the DHCP lease will not complete until this script exits
+				# This must be run asynchronously; the DHCP lease will not complete until this script exits.
+				# Save the job's process ID so the 'route-pre-down' and 'down' scripts can stop it if the VPN disconnects before
+				# it finishes. Otherwise it could set the VPN's DNS servers after the VPN has disconnected, and nothing would undo that.
+				( configureDhcpDns ; rm -f "/Library/Application Support/Tunnelblick/dhcp-dns-pid.txt" ) &
+				echo "$!" > "/Library/Application Support/Tunnelblick/dhcp-dns-pid.txt"
 				EXIT_CODE=0
 			fi
 		else
