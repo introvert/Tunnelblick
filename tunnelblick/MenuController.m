@@ -151,6 +151,7 @@ BOOL needToRepairPackages(void);
                                            fromMenu:        (NSMenu *)          theMenu
                                         workingName:        (NSString *)        workingName;
 -(void)             runCustomMenuItem:                      (NSMenuItem *)      item;
+-(void)             removeRecentConfigurationsMenuItems;
 -(void)             updateRecentConfigurationsMenuItems;
 -(BOOL)             setupHookupWatchdogTimer;
 -(void)             setupHotKeyWithCode:                    (UInt32)            keyCode
@@ -1934,6 +1935,18 @@ static pthread_mutex_t myVPNMenuMutex = PTHREAD_MUTEX_INITIALIZER;
             || (nShown > MIN_CONFIGURATIONS_TO_SHOW_RECENT_ON_MENU)  );
 }
 
+-(void) removeRecentConfigurationsMenuItems {
+
+    // Removes the "Recent" section from the Tunnelblick menu. LOCK myVPNMenuMutex BEFORE INVOKING THIS METHOD.
+    //
+    // This must be done before a configuration's VPNConnection is released, because a menu item does not retain its target.
+
+    NSInteger ix;
+    while (  (ix = [myVPNMenu indexOfItemWithTag: RECENT_CONFIGURATIONS_MENU_ITEM_TAG]) != -1  ) {
+        [myVPNMenu removeItemAtIndex: ix];
+    }
+}
+
 -(void) updateRecentConfigurationsMenuItems {
 
     // Puts the most recently connected configurations in a "Recent" section below the list of all configurations,
@@ -1943,15 +1956,12 @@ static pthread_mutex_t myVPNMenuMutex = PTHREAD_MUTEX_INITIALIZER;
     // Invoked on the main thread by menuWillOpen:
 
     if (  pthread_mutex_trylock( &myVPNMenuMutex ) != 0  ) {
-        return; // The menu is being changed; leave the "Recent" section as it is
+        return; // The menu is being changed. (Anything that releases a VPNConnection removes the "Recent" items first.)
     }
 
     NSMenu * menu = myVPNMenu;
 
-    NSInteger ix;
-    while (  (ix = [menu indexOfItemWithTag: RECENT_CONFIGURATIONS_MENU_ITEM_TAG]) != -1  ) {
-        [menu removeItemAtIndex: ix];
-    }
+    [self removeRecentConfigurationsMenuItems];
 
     unsigned maxRecent = [gTbDefaults unsignedIntForKey: @"maxRecentConfigurationsOnMenu"
                                                 default: DEFAULT_MAX_RECENT_CONFIGURATIONS_ON_MENU
@@ -1980,6 +1990,7 @@ static pthread_mutex_t myVPNMenuMutex = PTHREAD_MUTEX_INITIALIZER;
 
         // Insert after the separator that ends the list of configurations
         NSInteger insertIx = -1;
+        NSInteger ix;
         for (  ix = [self indexOfWhereFirstConnectionItemShouldGoInTunnelblickMenu]; ix < [menu numberOfItems]; ix++  ) {
             if (  [[menu itemAtIndex: ix] isSeparatorItem]  ) {
                 insertIx = ix + 1;
@@ -2858,6 +2869,10 @@ static pthread_mutex_t configModifyMutex = PTHREAD_MUTEX_INITIALIZER;
         }
         return;
     }
+
+    // Remove the "Recent" menu items (they will be recreated when the menu is next opened) because one of them may target this
+    // configuration's VPNConnection, which will be released when it is removed from myVPNConnectionDictionary
+    [self removeRecentConfigurationsMenuItems];
 
     // Remove connection from myVPNConnectionDictionary
     NSMutableDictionary * tempVPNConnectionDictionary = [myVPNConnectionDictionary mutableCopy];

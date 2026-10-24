@@ -3227,6 +3227,7 @@ ifConnectionPreference: (NSString *)     keySuffix
 
     [self addToLog: [NSString stringWithFormat: @"Will connect after disconnecting %@", [names componentsJoinedByString: @", "]]];
 
+    // Wait at least as long as waitUntilCompletelyDisconnected does, because an OpenVPN process that is reconnecting can take a while to exit
     NSTimeInterval timeout = [gTbDefaults timeIntervalForKey: @"timeoutForDisconnectingConfigurations"
                                                      default: 10.0
                                                          min: 0.0
@@ -3234,7 +3235,7 @@ ifConnectionPreference: (NSString *)     keySuffix
     switchingToThisConfiguration = TRUE;
     switchDeadline = [NSDate timeIntervalSinceReferenceDate] + (  (timeout == 0.0)
                                                                 ? 100.0
-                                                                : timeout);
+                                                                : MAX(timeout, 60.0));
     [self performSelector: @selector(connectWhenOtherConfigurationsHaveDisconnected) withObject: nil afterDelay: 0.2];
 }
 
@@ -3257,7 +3258,24 @@ ifConnectionPreference: (NSString *)     keySuffix
             return;
         }
 
-        [self addToLog: [NSString stringWithFormat: @"Timed out waiting for %lu other configuration(s) to disconnect; connecting anyway", (unsigned long)[others count]]];
+        // Don't connect: the other configurations' 'down' scripts may still be restoring the network settings, and connecting now could
+        // leave the computer with DNS servers that can't be reached after this configuration disconnects
+        switchingToThisConfiguration = FALSE;
+
+        NSMutableArray * names = [NSMutableArray arrayWithCapacity: [others count]];
+        VPNConnection * connection;
+        NSEnumerator * e = [others objectEnumerator];
+        while (  (connection = [e nextObject])  ) {
+            [names addObject: [connection localizedName]];
+        }
+        NSString * namesString = [names componentsJoinedByString: @", "];
+
+        [self addToLog: [NSString stringWithFormat: @"Not connecting because timed out waiting for other configuration(s) to disconnect: %@", namesString]];
+        TBShowAlertWindow(NSLocalizedString(@"Tunnelblick", @"Window title"),
+                          [NSString stringWithFormat: NSLocalizedString(@"Tunnelblick did not connect %@ because %@ did not finish disconnecting.\n\n"
+                                                                        @"Try again after it has disconnected.", @"Window text. The first '%@' is the name of a VPN configuration. The second '%@' is the name of one or more other VPN configurations, separated by commas."),
+                           [self localizedName], namesString]);
+        return;
     }
 
     switchingToThisConfiguration = FALSE;

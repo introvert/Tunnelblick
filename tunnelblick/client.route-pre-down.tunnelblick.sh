@@ -65,32 +65,49 @@ stop_pending_dhcp_dns_configuration() {
 	# The 'up' script configures DNS for a TAP device that uses DHCP in a background job, after it waits for the DHCP lease.
 	# If the VPN disconnects before that job finishes, stop it, so it doesn't set the VPN's DNS servers after the VPN has
 	# disconnected. (Nothing would undo that.)
+	#
+	# Each job is described by a file named for the job's tunnel device that contains the job's process ID and its OpenVPN's
+	# process ID. Stop the job for this script's tunnel device ($dev), and any job whose OpenVPN is no longer running (which
+	# covers the case where Tunnelblick runs this script to clean up after OpenVPN crashed, when $dev is not defined).
+	# Jobs for other connections that are still running are left alone.
 
-	local pid_file="/Library/Application Support/Tunnelblick/dhcp-dns-pid.txt"
-	if [ ! -f "$pid_file" ] ; then
-		return 0
-	fi
+	local pid_file job_pid openvpn_pid file_dev i
+	for pid_file in "/Library/Application Support/Tunnelblick/dhcp-dns-pid-"*.txt ; do
 
-	local job_pid ; job_pid="$( cat "$pid_file" 2>/dev/null || true )"
-	rm -f "$pid_file"
-
-	if [ -z "$job_pid" ] \
-	|| ! ps -p "$job_pid" -o command= 2>/dev/null | grep -q 'up\.tunnelblick\.sh' ; then
-		return 0
-	fi
-
-	pkill -P "$job_pid" 2>/dev/null || true
-	kill "$job_pid"     2>/dev/null || true
-
-	local i
-	for (( i=0; i<20; i++ )) ; do
-		if ! ps -p "$job_pid" &>/dev/null ; then
-			break
+		if [ ! -f "$pid_file" ] ; then
+			continue
 		fi
-		sleep 0.1
-	done
 
-	logMessage "Stopped the pending configuration of DNS via DHCP (process $job_pid) because the VPN is disconnecting"
+		file_dev="${pid_file##*/dhcp-dns-pid-}"
+		file_dev="${file_dev%.txt}"
+		read -r job_pid openvpn_pid < "$pid_file" 2>/dev/null || true
+
+		if [ -z "$job_pid" ] \
+		|| ! ps -p "$job_pid" -o command= 2>/dev/null | grep -q 'up\.tunnelblick\.sh' ; then
+			rm -f "$pid_file" 2>/dev/null || true      # The job has finished
+			continue
+		fi
+
+		if [ "$file_dev" != "${dev:-}" ] \
+		&& [ -n "$openvpn_pid" ] \
+		&& ps -p "$openvpn_pid" -o comm= 2>/dev/null | grep -q 'openvpn$' ; then
+			continue                                     # The job belongs to another connection that is still running
+		fi
+
+		pkill -P "$job_pid" 2>/dev/null || true
+		kill "$job_pid"     2>/dev/null || true
+
+		for (( i=0; i<20; i++ )) ; do
+			if ! ps -p "$job_pid" &>/dev/null ; then
+				break
+			fi
+			sleep 0.1
+		done
+
+		rm -f "$pid_file" 2>/dev/null || true
+
+		logMessage "Stopped the pending configuration of DNS via DHCP for $file_dev (process $job_pid) because the VPN is disconnecting"
+	done
 }
 
 ##########################################################################################
@@ -110,6 +127,13 @@ saved_state_belongs_to_another_running_openvpn() {
 	local saved_pid="$1"
 
 	if [ -z "$saved_pid" ] || [ "$saved_pid" = "$PPID" ] ; then
+		return 1
+	fi
+
+	# When OpenVPN uses the 'openvpn-down-root' plugin (for configurations with 'user' and/or 'group' options), the 'down'
+	# script is run by a process that the plugin forked from OpenVPN, so OpenVPN is the parent of PPID
+	local grandparent_pid ; grandparent_pid="$( ps -o ppid= -p "$PPID" 2>/dev/null | tr -d ' ' || true )"
+	if [ "$saved_pid" = "$grandparent_pid" ] ; then
 		return 1
 	fi
 

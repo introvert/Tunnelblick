@@ -100,6 +100,9 @@
 /* Button */
 "Disconnect Others and Connect" = "Disconnect Others and Connect";
 
+/* Window text. The first '%@' is the name of a VPN configuration. The second '%@' is the name of one or more other VPN configurations, separated by commas. */
+"Tunnelblick did not connect %@ because %@ did not finish disconnecting.\n\nTry again after it has disconnected." = "Tunnelblick did not connect %1$@ because %2$@ did not finish disconnecting.\n\nTry again after it has disconnected.";
+
 /* Button */
 "Do Not Re-enable Network Access" = "Do Not Re-enable Network Access";
 

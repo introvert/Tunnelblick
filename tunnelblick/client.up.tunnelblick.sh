@@ -755,6 +755,13 @@ previous_vpn_dns_is_still_set() {
 	# Returns 0 if State:/Network/OpenVPN was left by an earlier VPN connection on the same network service AND that service's DNS
 	# servers are still the ones that the earlier connection set. That happens when the earlier connection's 'down' script did not
 	# run or did not finish (for example, because OpenVPN, Tunnelblick, or the computer crashed). Otherwise returns 1.
+	#
+	# It also happens when the earlier connection is still connected (several configurations connected at the same time). Keeping
+	# the settings from before ANY VPN connected is deliberate in that case, too, because then those are the settings in effect after
+	# all the connections have disconnected, in either order. (If the earlier connection disconnects first, its 'down' script does
+	# not restore anything because the saved settings belong to this connection. If this connection disconnects first, the earlier
+	# one is left without its DNS settings; Tunnelblick warns that 'Set nameserver' works for only one VPN at a time.) Saving the
+	# earlier VPN's settings instead would make the last disconnection "restore" DNS servers that are reachable only through that VPN.
 
 	local saved_state saved_service expected current
 
@@ -2308,8 +2315,9 @@ if ${ARG_TAP} ; then
 				# This must be run asynchronously; the DHCP lease will not complete until this script exits.
 				# Save the job's process ID so the 'route-pre-down' and 'down' scripts can stop it if the VPN disconnects before
 				# it finishes. Otherwise it could set the VPN's DNS servers after the VPN has disconnected, and nothing would undo that.
-				( configureDhcpDns ; rm -f "/Library/Application Support/Tunnelblick/dhcp-dns-pid.txt" ) &
-				echo "$!" > "/Library/Application Support/Tunnelblick/dhcp-dns-pid.txt"
+				# The file is per tunnel device, and holds the job's process ID and OpenVPN's process ID. It is removed by those scripts.
+				configureDhcpDns &
+				echo "$! ${PPID}" > "/Library/Application Support/Tunnelblick/dhcp-dns-pid-${dev}.txt"
 				EXIT_CODE=0
 			fi
 		else
